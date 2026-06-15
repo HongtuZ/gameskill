@@ -1,2 +1,7 @@
 dataset/
 .DS_Store
+*.jsonl
+output/
+*.ipynb_checkpoints/
+annotations/
+summaries/

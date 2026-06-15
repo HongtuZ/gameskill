@@ -1,21 +1,20 @@
 import os
 
 # os.environ['SWIFT_DEBUG'] = '1'
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-os.environ["IMAGE_MAX_TOKEN_NUM"] = "2048"
-os.environ["VIDEO_MAX_TOKEN_NUM"] = "2048"
-os.environ["FPS_MAX_FRAMES"] = "20"
-
-from pathlib import Path
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+os.environ['IMAGE_MAX_TOKEN_NUM'] = '2048'
+os.environ['VIDEO_MAX_TOKEN_NUM'] = '2048'
+os.environ['FPS_MAX_FRAMES'] = '20'
 
 from peft import PeftModel
 from swift import get_model_processor, get_template
-from swift.infer_engine import InferRequest, RequestConfig, TransformersEngine
+from swift.infer_engine import TransformersEngine, InferRequest, RequestConfig
+from pathlib import Path
 
-adapter_dir = "output/Qwen3.5-4B-lmdb/checkpoint-1423"
+adapter_dir = 'output/Qwen3.5-4B-lmdb/checkpoint-1423'
 enable_thinking = True
 
-model, processor = get_model_processor("Qwen/Qwen3.5-4B")  # attn_impl='flash_attention_2'
+model, processor = get_model_processor('Qwen/Qwen3.5-4B')  # attn_impl='flash_attention_2'
 model = PeftModel.from_pretrained(model, adapter_dir)
 template = get_template(processor, enable_thinking=enable_thinking)
 engine = TransformersEngine(model, template=template)
@@ -44,3 +43,4 @@ print(response)
 #         continue
 #     print(chunk.choices[0].delta.content, end='', flush=True)
 # print()
+
