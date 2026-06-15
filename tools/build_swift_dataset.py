@@ -1,9 +1,8 @@
+import argparse
 import json
 import re
-import argparse
 from pathlib import Path
-from typing import Dict, List, Optional, Any
-
+from typing import Any, Dict, List, Optional
 
 # ==================== 配置区 ====================
 
@@ -18,6 +17,7 @@ DEFAULT_ANSWER_LOSS_SCALE = 2.0
 
 # ==================== 工具函数 ====================
 
+
 def load_game_prompt(game: str) -> str:
     """从markdown文件加载游戏专属提示词"""
     prompt_path = PROMPTS_DIR / f"{game}.md"
@@ -25,31 +25,32 @@ def load_game_prompt(game: str) -> str:
         raise FileNotFoundError(f"未找到游戏提示词文件: {prompt_path}")
     return prompt_path.read_text(encoding="utf-8")
 
+
 def remove_reasoning_step(reasoning_text, step_index_to_remove=2):
     """
     删除 reasoning 字符串中的指定步骤，并重新编号
-    
+
     参数:
         reasoning_text: 原始 reasoning 字符串
         step_index_to_remove: 要删除的步骤索引（从0开始，默认2=第3步）
-    
+
     返回:
         处理后的 reasoning 字符串
     """
-    pattern = r'(\d+)\)\s*([^：:]+)[：:](.*?)(?=\d+\)\s*|$)'
+    pattern = r"(\d+)\)\s*([^：:]+)[：:](.*?)(?=\d+\)\s*|$)"
     matches = re.findall(pattern, reasoning_text, re.DOTALL)
-    
+
     if not matches or step_index_to_remove >= len(matches):
         return reasoning_text
-    
+
     # 删除指定步骤并重新编号
     filtered = [m for i, m in enumerate(matches) if i != step_index_to_remove]
-    
+
     new_reasoning = ""
     for i, (old_num, title, content) in enumerate(filtered, 1):
-        content_clean = ' '.join(content.strip().split())
+        content_clean = " ".join(content.strip().split())
         new_reasoning += f"{i}) {title.strip()}：{content_clean}"
-    
+
     return new_reasoning
 
 
@@ -92,43 +93,31 @@ def build_sample(
     annotation: Dict[str, Any],
     video_path: Path,
     think_loss_scale: float = DEFAULT_THINK_LOSS_SCALE,
-    answer_loss_scale: float = DEFAULT_ANSWER_LOSS_SCALE
+    answer_loss_scale: float = DEFAULT_ANSWER_LOSS_SCALE,
 ) -> Dict[str, Any]:
     game_prompt = load_game_prompt(game_name)
     think_content = build_think_content(annotation)
     answer_content = build_answer_content(annotation)
 
-    SYSTEM_PROMPT = f"你是一个专业的FPS游戏实时教练。请根据视频片段分析玩家操作并结合具体游戏机制给出建议。"
+    SYSTEM_PROMPT = "你是一个专业的FPS游戏实时教练。请根据视频片段分析玩家操作并结合具体游戏机制给出建议。"
 
     USER_PROMPT = "<video>\n请分析这段游戏视频片段，判断是否需要立即给出实时指导。"
-
 
     sample = {
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": USER_PROMPT},
-            {
-                "role": "assistant",
-                "content": think_content,
-                "loss_scale": think_loss_scale
-            },
-            {
-                "role": "assistant",
-                "content": answer_content,
-                "loss_scale": answer_loss_scale
-            }
+            {"role": "assistant", "content": think_content, "loss_scale": think_loss_scale},
+            {"role": "assistant", "content": answer_content, "loss_scale": answer_loss_scale},
         ],
-        "videos": [str(video_path.resolve())]
+        "videos": [str(video_path.resolve())],
     }
 
     return sample
 
 
 def process_annotation_file(
-    json_path: Path,
-    video_root: Path,
-    think_loss_scale: float,
-    answer_loss_scale: float
+    json_path: Path, video_root: Path, think_loss_scale: float, answer_loss_scale: float
 ) -> Optional[Dict[str, Any]]:
     """处理单个注释文件"""
     try:
@@ -149,9 +138,7 @@ def process_annotation_file(
     video_path = video_path.resolve()
 
     return build_sample(
-        game, annotation, video_path,
-        think_loss_scale=think_loss_scale,
-        answer_loss_scale=answer_loss_scale
+        game, annotation, video_path, think_loss_scale=think_loss_scale, answer_loss_scale=answer_loss_scale
     )
 
 
@@ -161,7 +148,7 @@ def build_dataset(
     output_path: Path,
     games: Optional[List[str]],
     think_loss_scale: float,
-    answer_loss_scale: float
+    answer_loss_scale: float,
 ) -> None:
     """主流程：扫描注释目录，生成 JSONL"""
     json_files = sorted(annotation_root.rglob("*_annotation.json"))
@@ -177,10 +164,7 @@ def build_dataset(
             if game_in_path not in games:
                 continue
 
-        sample = process_annotation_file(
-            jpath, video_root,
-            think_loss_scale, answer_loss_scale
-        )
+        sample = process_annotation_file(jpath, video_root, think_loss_scale, answer_loss_scale)
         if sample:
             samples.append(sample)
         else:
@@ -195,7 +179,7 @@ def build_dataset(
     neg = len(samples) - pos
 
     print("\n" + "=" * 50)
-    print(f"数据集构造完成")
+    print("数据集构造完成")
     print(f"输出路径 : {output_path.resolve()}")
     print(f"成功样本 : {len(samples)}")
     print(f"跳过样本 : {skip_count}")
@@ -276,6 +260,7 @@ def split_train_val(dataset_path: Path, train_ratio: float = 0.9, seed: int = 42
         lines = f.readlines()
 
     import random
+
     random.seed(seed)
     random.shuffle(lines)
 
@@ -288,7 +273,7 @@ def split_train_val(dataset_path: Path, train_ratio: float = 0.9, seed: int = 42
     with val_path.open("w", encoding="utf-8") as f:
         f.writelines(val_lines)
 
-    print(f"\n[划分] 完成")
+    print("\n[划分] 完成")
     print(f"  训练集: {train_path.resolve()} ({len(train_lines)} 条)")
     print(f"  验证集: {val_path.resolve()} ({len(val_lines)} 条)")
 
@@ -301,10 +286,15 @@ if __name__ == "__main__":
     parser.add_argument("--video-root", type=Path, default=VIDEO_ROOT, help="视频文件根目录")
     parser.add_argument("--output", type=Path, default=OUTPUT_PATH, help="输出 JSONL 路径")
     parser.add_argument("--games", nargs="+", default=None, help="过滤指定游戏，如 delta valorant")
-    parser.add_argument("--think-loss-scale", type=float, default=DEFAULT_THINK_LOSS_SCALE,
-                        help="think 部分 loss_scale（默认 1.0）")
-    parser.add_argument("--answer-loss-scale", type=float, default=DEFAULT_ANSWER_LOSS_SCALE,
-                        help="answer 部分 loss_scale（默认 2.0，权重更高）")
+    parser.add_argument(
+        "--think-loss-scale", type=float, default=DEFAULT_THINK_LOSS_SCALE, help="think 部分 loss_scale（默认 1.0）"
+    )
+    parser.add_argument(
+        "--answer-loss-scale",
+        type=float,
+        default=DEFAULT_ANSWER_LOSS_SCALE,
+        help="answer 部分 loss_scale（默认 2.0，权重更高）",
+    )
     parser.add_argument("--validate", action="store_true", help="验证数据集格式")
     parser.add_argument("--split", action="store_true", help="划分训练/验证集")
     parser.add_argument("--train-ratio", type=float, default=0.9, help="训练集比例")
@@ -317,7 +307,7 @@ if __name__ == "__main__":
         output_path=args.output,
         games=args.games,
         think_loss_scale=args.think_loss_scale,
-        answer_loss_scale=args.answer_loss_scale
+        answer_loss_scale=args.answer_loss_scale,
     )
 
     if args.validate:

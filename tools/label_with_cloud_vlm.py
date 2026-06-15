@@ -186,7 +186,6 @@ def generate_annotation(
     # 读取前10s视频
     video_b64 = encode_video(clip_path)
 
-
     # 构建教练system prompt
     system_prompt = f"""你是一位{game.upper()}职业教练，精通该游戏的战术体系。
 

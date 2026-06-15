@@ -21,7 +21,7 @@ from swift import get_model_processor, get_template
 from swift.dataset import LazyLLMDataset
 from swift.trainers import Seq2SeqTrainer, Seq2SeqTrainingArguments
 from swift.tuners import LoraConfig, Swift
-from swift.utils import get_logger, get_model_parameter_info, get_multimodal_target_regex, plot_images, seed_everything
+from swift.utils import get_logger, get_model_parameter_info, get_multimodal_target_regex, seed_everything
 from torch.utils.data import Dataset, Subset
 
 logger = get_logger()
