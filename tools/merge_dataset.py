@@ -5,18 +5,15 @@ from tqdm import tqdm
 
 # 配置
 INPUT_DIRS = [
-    "output/dataset_01",
-    "output/dataset_02",
-    "output/dataset_03",
-    "output/dataset_04",
-    "output/dataset_05",
-    "output/dataset_06",
-    "output/dataset_07",
-    "output/dataset_08",
-    "output/dataset_09",
-    "output/dataset_10",
+    "annos/annotations",
+    "annos/annotations 2",
+    "annos/annotations 3",
+    "annos/annotations 4",
+    "annos/annotations 5",
+    "annos/annotations 6",
+    "annos/annotations-gaotai",
 ]  # 要合并的多个目录（也支持 glob 模式，如 "output/dataset_*"）
-OUTPUT_DIR = "dataset"  # 合并后的输出目录，与原始 dataset 结构一致
+OUTPUT_DIR = "annotations"  # 合并后的输出目录，与原始 dataset 结构一致
 EXISTING_OK = True  # 目标已存在时是否跳过（False 则覆盖）
 
 
@@ -75,10 +72,14 @@ def merge_datasets(input_dirs, output_dir, existing_ok=True):
         dst = output_dir / rel_path
 
         if dst.exists():
-            # 目标目录中已存在同名视频，跳过
-            skipped += 1
-            skipped_files.append(str(rel_path))
-            continue
+            if existing_ok:
+                # 目标目录中已存在同名文件，跳过
+                skipped += 1
+                skipped_files.append(str(rel_path))
+                continue
+            else:
+                # 覆盖已有文件
+                pass
 
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(str(file_path), str(dst))
@@ -86,9 +87,11 @@ def merge_datasets(input_dirs, output_dir, existing_ok=True):
 
     print(f"\n完成！复制: {copied} 个文件, 跳过(已存在): {skipped} 个文件")
     if skipped_files:
-        print("\n跳过的文件列表:")
-        for f in skipped_files:
+        print(f"\n跳过的文件列表 ({len(skipped_files)} 个):")
+        for f in skipped_files[:20]:
             print(f"  - {f}")
+        if len(skipped_files) > 20:
+            print(f"  ... 共 {len(skipped_files)} 个")
     print(f"\n合并结果在: {output_dir}")
 
 
