@@ -30,6 +30,16 @@ def get_video_duration(video_path: Path) -> float | None:
         return None
 
 
+def segment_exist(output_file: Path, expected_duration: float) -> bool:
+    """检查片段是否已存在且时长匹配"""
+    if not output_file.exists():
+        return False
+    actual_duration = get_video_duration(output_file)
+    if actual_duration is None:
+        return False
+    return abs(actual_duration - expected_duration) < 0.5
+
+
 def split_video_reencode(
     video_path: Path, output_file: Path, start_time: float, duration: float, crf: int = 23, preset: str = "fast"
 ) -> bool:
@@ -72,19 +82,25 @@ def split_video_reencode(
 
 
 def split_single_video(
-    video_path: Path, videos_dir: Path, output_dir: Path, segment_duration: int, crf: int, preset: str
+    video_path: Path,
+    videos_dir: Path,
+    output_dir: Path,
+    segment_duration: int,
+    crf: int,
+    preset: str,
+    segment_counter=None,
 ) -> tuple[Path, bool, str]:
     """
     处理单个视频的完整切片任务（用于多进程并行）
 
     Returns:
-        (video_path, success, message)
+        (video_path, success, message, total_segments, skipped_segments)
     """
     video_name = video_path.stem
     duration = get_video_duration(video_path)
 
     if duration is None:
-        return (video_path, False, "无法获取视频时长")
+        return (video_path, False, "无法获取视频时长", 0, 0)
 
     relative_path = video_path.relative_to(videos_dir)
     video_output_dir = output_dir / relative_path.parent / video_name
@@ -92,20 +108,32 @@ def split_single_video(
 
     total_segments = int(duration // segment_duration) + (1 if duration % segment_duration > 5 else 0)
 
+    # 检查已存在的片段
+    skipped = 0
     for segment_idx in range(total_segments):
         start_time = segment_idx * segment_duration
         end_time = min(start_time + segment_duration, duration)
         actual_duration = end_time - start_time
-
         segment_num = segment_idx + 1
         output_file = video_output_dir / f"{segment_num:03d}.mp4"
+
+        if segment_exist(output_file, actual_duration):
+            skipped += 1
+            if segment_counter is not None:
+                with segment_counter[0].get_lock():
+                    segment_counter[0].value += 1
+            continue
 
         success = split_video_reencode(video_path, output_file, start_time, actual_duration, crf, preset)
 
         if not success:
-            return (video_path, False, f"片段 {segment_num:03d} 生成失败")
+            return (video_path, False, f"片段 {segment_num:03d} 生成失败", total_segments, skipped)
 
-    return (video_path, True, f"生成 {total_segments} 个片段")
+        if segment_counter is not None:
+            with segment_counter[0].get_lock():
+                segment_counter[0].value += 1
+
+    return (video_path, True, f"生成 {total_segments} 个片段", total_segments, skipped)
 
 
 def find_mp4_files(videos_dir: Path) -> list[Path]:
@@ -188,8 +216,21 @@ def main():
         preset=args.preset,
     )
 
+    # 使用 Manager 创建跨进程共享计数器和锁，用于片段级进度显示
+    manager = multiprocessing.Manager()
+    shared_counter = manager.Value("i", 0)
+    shared_lock = manager.Lock()
+    task_func = partial(task_func, segment_counter=(shared_counter, shared_lock))
+
     success_count = 0
     fail_count = 0
+    total_segments_all = 0
+    skipped_segments_all = 0
+
+    # 片段级进度条
+    seg_pbar = tqdm(total=0, desc="切片进度", unit="clip", leave=True, position=0)
+    # 视频级进度条
+    vid_pbar = tqdm(total=len(mp4_files), desc="视频进度", unit="video", leave=True, position=1)
 
     # 使用进程池并行处理
     with ProcessPoolExecutor(max_workers=num_workers) as executor:
@@ -197,19 +238,42 @@ def main():
         future_to_video = {executor.submit(task_func, video_path): video_path for video_path in mp4_files}
 
         # 使用tqdm显示进度
-        for future in tqdm(as_completed(future_to_video), total=len(mp4_files), desc="总进度", unit="video"):
-            video_path, success, message = future.result()
+        for future in as_completed(future_to_video):
+            result = future.result()
+            video_path = result[0]
+            success = result[1]
+            message = result[2]
+            total_segs = result[3] if len(result) > 3 else 0
+            skipped_segs = result[4] if len(result) > 4 else 0
             relative_path = video_path.relative_to(videos_dir)
+
+            # 更新片段进度条
+            seg_pbar.update(total_segs)
+            total_segments_all += total_segs
+            skipped_segments_all += skipped_segs
+
+            # 更新视频进度条
+            vid_pbar.update(1)
+            vid_pbar.set_postfix(
+                video=str(relative_path),
+                segs=f"{total_segs - skipped_segs}/{total_segs}",
+                skip=skipped_segs,
+            )
 
             if success:
                 success_count += 1
-                tqdm.write(f"✓ {relative_path} → {message}")
+                tqdm.write(f"✓ {relative_path} → {message} (跳过 {skipped_segs})")
             else:
                 fail_count += 1
                 tqdm.write(f"✗ {relative_path} → {message}")
 
+    seg_pbar.close()
+    vid_pbar.close()
+    manager.shutdown()
+
     print("\n" + "=" * 50)
     print(f"处理完成！成功: {success_count}, 失败: {fail_count}")
+    print(f"总切片数: {total_segments_all}, 跳过已存在: {skipped_segments_all}")
     print(f"所有切片保存在: {output_dir}")
 
 
