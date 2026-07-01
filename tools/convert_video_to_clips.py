@@ -120,7 +120,7 @@ def split_single_video(
         if segment_exist(output_file, actual_duration):
             skipped += 1
             if segment_counter is not None:
-                with segment_counter[0].get_lock():
+                with segment_counter[1]:
                     segment_counter[0].value += 1
             continue
 
@@ -130,7 +130,7 @@ def split_single_video(
             return (video_path, False, f"片段 {segment_num:03d} 生成失败", total_segments, skipped)
 
         if segment_counter is not None:
-            with segment_counter[0].get_lock():
+            with segment_counter[1]:
                 segment_counter[0].value += 1
 
     return (video_path, True, f"生成 {total_segments} 个片段", total_segments, skipped)
