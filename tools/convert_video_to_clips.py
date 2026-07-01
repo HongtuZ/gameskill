@@ -41,7 +41,13 @@ def segment_exist(output_file: Path, expected_duration: float) -> bool:
 
 
 def split_video_reencode(
-    video_path: Path, output_file: Path, start_time: float, duration: float, crf: int = 23, preset: str = "fast"
+    video_path: Path,
+    output_file: Path,
+    start_time: float,
+    duration: float,
+    crf: int = 23,
+    preset: str = "fast",
+    device: str = "gpu",
 ) -> bool:
     """使用重新编码模式切片（精确到帧，无黑屏）"""
     cmd = [
@@ -50,22 +56,42 @@ def split_video_reencode(
         "-hide_banner",
         "-loglevel",
         "error",
-        "-hwaccel",
-        "cuda",
-        "-hwaccel_output_format",
-        "cuda",
+    ]
+
+    # 解码端：GPU 使用 cuda 硬件加速，CPU 不指定
+    if device == "gpu":
+        cmd += ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
+
+    cmd += [
         "-ss",
         str(start_time),
         "-t",
         str(duration),
         "-i",
         str(video_path),
-        "-c:v",
-        "h264_nvenc",
-        "-preset",
-        preset,
-        "-cq",
-        str(crf),
+    ]
+
+    # 编码端：GPU 使用 h264_nvenc，CPU 使用 libx264
+    if device == "gpu":
+        cmd += [
+            "-c:v",
+            "h264_nvenc",
+            "-preset",
+            preset,
+            "-cq",
+            str(crf),
+        ]
+    else:
+        cmd += [
+            "-c:v",
+            "libx264",
+            "-preset",
+            preset,
+            "-crf",
+            str(crf),
+        ]
+
+    cmd += [
         "-c:a",
         "aac",
         "-b:a",
@@ -74,6 +100,7 @@ def split_video_reencode(
         "+faststart",
         str(output_file),
     ]
+
     try:
         subprocess.run(cmd, capture_output=True, check=True)
         return True
@@ -88,8 +115,8 @@ def split_single_video(
     segment_duration: int,
     crf: int,
     preset: str,
-    segment_counter=None,
-) -> tuple[Path, bool, str]:
+    device: str,
+) -> tuple[Path, bool, str, int, int]:
     """
     处理单个视频的完整切片任务（用于多进程并行）
 
@@ -108,7 +135,7 @@ def split_single_video(
 
     total_segments = int(duration // segment_duration) + (1 if duration % segment_duration > 5 else 0)
 
-    # 检查已存在的片段
+    # 检查已存在的片段，跳过已生成的
     skipped = 0
     for segment_idx in range(total_segments):
         start_time = segment_idx * segment_duration
@@ -119,19 +146,12 @@ def split_single_video(
 
         if segment_exist(output_file, actual_duration):
             skipped += 1
-            if segment_counter is not None:
-                with segment_counter[1]:
-                    segment_counter[0].value += 1
             continue
 
-        success = split_video_reencode(video_path, output_file, start_time, actual_duration, crf, preset)
+        success = split_video_reencode(video_path, output_file, start_time, actual_duration, crf, preset, device)
 
         if not success:
             return (video_path, False, f"片段 {segment_num:03d} 生成失败", total_segments, skipped)
-
-        if segment_counter is not None:
-            with segment_counter[1]:
-                segment_counter[0].value += 1
 
     return (video_path, True, f"生成 {total_segments} 个片段", total_segments, skipped)
 
@@ -161,8 +181,15 @@ def main():
         "--preset",
         type=str,
         default="fast",
-        choices=["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow"],
-        help="重新编码时的预设速度（默认: fast）",
+        help="编码预设（GPU: ultrafast/superfast/veryfast/faster/fast/medium/slow/slower/veryslow; CPU: 同左）（默认: fast）",
+    )
+
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="cpu",
+        choices=["cpu", "gpu"],
+        help="编解码设备：gpu 使用 CUDA+NVENC，cpu 使用 libx264（默认: cpu）",
     )
 
     args = parser.parse_args()
@@ -200,6 +227,7 @@ def main():
     print(f"输出目录: {output_dir}")
     print(f"切片时长: {segment_duration}s")
     print(f"并行进程: {num_workers} 个")
+    print(f"编码设备: {args.device.upper()}")
     print(f"编码预设: {args.preset}, CRF: {args.crf}")
     print("=" * 50)
 
@@ -214,51 +242,36 @@ def main():
         segment_duration=segment_duration,
         crf=args.crf,
         preset=args.preset,
+        device=args.device,
     )
-
-    # 使用 Manager 创建跨进程共享计数器和锁，用于片段级进度显示
-    manager = multiprocessing.Manager()
-    shared_counter = manager.Value("i", 0)
-    shared_lock = manager.Lock()
-    task_func = partial(task_func, segment_counter=(shared_counter, shared_lock))
 
     success_count = 0
     fail_count = 0
     total_segments_all = 0
     skipped_segments_all = 0
 
-    # 片段级进度条
-    seg_pbar = tqdm(total=0, desc="切片进度", unit="clip", leave=True, position=0)
-    # 视频级进度条
-    vid_pbar = tqdm(total=len(mp4_files), desc="视频进度", unit="video", leave=True, position=1)
-
     # 使用进程池并行处理
     with ProcessPoolExecutor(max_workers=num_workers) as executor:
         # 提交所有任务
         future_to_video = {executor.submit(task_func, video_path): video_path for video_path in mp4_files}
 
-        # 使用tqdm显示进度
-        for future in as_completed(future_to_video):
+        # 使用tqdm显示视频级进度
+        for future in tqdm(
+            as_completed(future_to_video),
+            total=len(mp4_files),
+            desc="视频进度",
+            unit="video",
+        ):
             result = future.result()
             video_path = result[0]
             success = result[1]
             message = result[2]
-            total_segs = result[3] if len(result) > 3 else 0
-            skipped_segs = result[4] if len(result) > 4 else 0
+            total_segs = result[3]
+            skipped_segs = result[4]
             relative_path = video_path.relative_to(videos_dir)
 
-            # 更新片段进度条
-            seg_pbar.update(total_segs)
             total_segments_all += total_segs
             skipped_segments_all += skipped_segs
-
-            # 更新视频进度条
-            vid_pbar.update(1)
-            vid_pbar.set_postfix(
-                video=str(relative_path),
-                segs=f"{total_segs - skipped_segs}/{total_segs}",
-                skip=skipped_segs,
-            )
 
             if success:
                 success_count += 1
@@ -266,10 +279,6 @@ def main():
             else:
                 fail_count += 1
                 tqdm.write(f"✗ {relative_path} → {message}")
-
-    seg_pbar.close()
-    vid_pbar.close()
-    manager.shutdown()
 
     print("\n" + "=" * 50)
     print(f"处理完成！成功: {success_count}, 失败: {fail_count}")
