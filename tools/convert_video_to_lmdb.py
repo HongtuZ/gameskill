@@ -80,7 +80,7 @@ def _probe_video(video_path: Path) -> tuple:
     return total_frames
 
 
-def _worker_extract(videos_batch, shard_dir, num_frames, gpu_id=-1):
+def _worker_extract(videos_batch, shard_dir, num_frames, gpu_id=-1, tmp_dir_base=None):
     """
     Worker 进程：ffmpeg 抽帧输出 JPEG 临时文件 → 读入 LMDB。
     gpu_id >= 0 使用指定 GPU 硬件解码，-1 使用 CPU。
@@ -92,7 +92,7 @@ def _worker_extract(videos_batch, shard_dir, num_frames, gpu_id=-1):
     video_stems = set()
 
     # 每个 worker 独享临时目录
-    tmp_dir = tempfile.mkdtemp(prefix=f"worker_frames_{gpu_id}_")
+    tmp_dir = tempfile.mkdtemp(prefix=f"worker_frames_{gpu_id}_", dir=tmp_dir_base)
 
     for video_path in videos_batch:
         try:
@@ -215,7 +215,14 @@ def main():
     parser.add_argument("--workers", "-w", type=int, default=8, help="并行进程数")
     parser.add_argument("--num-frames", type=int, default=NUM_FRAMES, help="每条视频抽取帧数")
     parser.add_argument("--gpu", action="store_true", help="使用 NVIDIA GPU 硬件解码加速（自动分配多 GPU）")
+    parser.add_argument("--tmp-dir", default=None, help="临时文件目录（默认 /tmp，磁盘不足时可指定其他路径）")
     args = parser.parse_args()
+
+    # 临时目录
+    tmp_dir_base = args.tmp_dir
+    if tmp_dir_base:
+        Path(tmp_dir_base).mkdir(parents=True, exist_ok=True)
+        print(f"临时文件目录: {tmp_dir_base}")
 
     # GPU 检测与分配
     gpu_ids = []
@@ -235,7 +242,7 @@ def main():
     print(f"共发现 {len(all_videos)} 个视频，开始并行抽帧...")
 
     # 将视频均分给各 worker，每个 worker 写独立临时 LMDB
-    tmp_root = Path(tempfile.mkdtemp(prefix="lmdb_shards_"))
+    tmp_root = Path(tempfile.mkdtemp(prefix="lmdb_shards_", dir=tmp_dir_base))
     batches = [[] for _ in range(args.workers)]
     for i, v in enumerate(all_videos):
         batches[i % args.workers].append(v)
@@ -257,7 +264,9 @@ def main():
                 assigned_gpu = -1
             tag = f"GPU{assigned_gpu}" if assigned_gpu >= 0 else "CPU"
             print(f"  Worker {i} ({len(batch)} 条视频) → {tag}")
-            futures.append(executor.submit(_worker_extract, batch, shard_dirs[i], args.num_frames, assigned_gpu))
+            futures.append(
+                executor.submit(_worker_extract, batch, shard_dirs[i], args.num_frames, assigned_gpu, tmp_dir_base)
+            )
         for future in tqdm.tqdm(as_completed(futures), total=len(futures), desc="抽帧"):
             try:
                 stats, stems = future.result()
