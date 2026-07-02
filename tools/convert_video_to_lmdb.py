@@ -17,7 +17,7 @@ MAP_SIZE = 25 * 1024 * 1024 * 1024  # 80GB，必须大于总数据量
 
 
 def _list_gpus() -> list:
-    """检测所有可用的 NVIDIA GPU，返回 GPU 名称列表"""
+    """检测所有可用的 NVIDIA GPU，返回 GPU ID 列表"""
     try:
         r = subprocess.run(
             ["nvidia-smi", "--query-gpu=index,name", "--format=csv,noheader,nounits"],
@@ -28,7 +28,8 @@ def _list_gpus() -> list:
         if r.returncode == 0 and r.stdout.strip():
             gpus = []
             for line in r.stdout.strip().split("\n"):
-                parts = line.split(",")
+                # split 限制次数，防止 GPU 名称含逗号（如 "RTX PRO 6000, xxx"）
+                parts = line.split(",", 1)
                 if len(parts) >= 2:
                     idx, name = int(parts[0].strip()), parts[1].strip()
                     gpus.append((idx, name))
@@ -86,10 +87,28 @@ def _probe_video(video_path: Path) -> tuple:
     return total_frames, width, height
 
 
+def _run_ffmpeg(cmd, frame_size, num_frames, timeout=120):
+    """
+    流式读取 ffmpeg 管道输出，逐帧返回 bytes，避免一次性加载全部数据到内存。
+    返回 (actual_frames_count, frame_data_list)
+    """
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    frames = []
+    for i in range(num_frames):
+        chunk = proc.stdout.read(frame_size)
+        if len(chunk) < frame_size:
+            break
+        frames.append(chunk)
+    proc.stdout.close()
+    proc.wait(timeout=timeout)
+    return frames, proc
+
+
 def _worker_extract(videos_batch, shard_dir, num_frames, gpu_id=-1):
     """
     Worker 进程：用 ffmpeg 管道抽帧，直接写入独立 LMDB 分片。
     gpu_id >= 0 表示使用指定 GPU 硬件解码，-1 表示 CPU 软件解码。
+    GPU 解码失败时自动回退 CPU。
     返回 (stats_dict, video_stems_set)
     """
     env = lmdb.open(shard_dir, map_size=MAP_SIZE, writemap=True)
@@ -104,55 +123,49 @@ def _worker_extract(videos_batch, shard_dir, num_frames, gpu_id=-1):
                 continue
 
             indices = [int(i * total_frames / num_frames) for i in range(num_frames)]
-            # select 过滤器：只输出指定序号的帧
             select_expr = "+".join(f"eq(n\\,{idx})" for idx in indices)
             prefix = f"{video_path.parent.name}/{video_path.stem}"
             video_stems.add(prefix)
-
-            # ffmpeg 解码 → rawvideo 管道输出，纯内存无磁盘 I/O
-            cmd = ["ffmpeg", "-v", "error"]
-            if gpu_id >= 0:
-                # 指定 GPU 硬件解码
-                cmd += ["-hwaccel", "cuda", "-hwaccel_device", str(gpu_id), "-hwaccel_output_format", "cuda"]
-            cmd += ["-i", str(video_path)]
-            if gpu_id >= 0:
-                # GPU 解码后先下载到 CPU，再做 select 过滤
-                vf = f"hwdownload,format=nv12,format=rgb24,select='{select_expr}'"
-            else:
-                vf = f"select='{select_expr}'"
-            cmd += [
-                "-vf",
-                vf,
-                "-vsync",
-                "0",
-                "-f",
-                "rawvideo",
-                "-pix_fmt",
-                "rgb24",
-                "pipe:1",
-            ]
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            raw, _ = proc.communicate(timeout=120)
-
-            if proc.returncode != 0 or len(raw) == 0:
-                stats["empty"] += 1
-                continue
-
             frame_size = width * height * 3  # 单帧字节数 (RGB)
-            actual_frames = len(raw) // frame_size
-            if actual_frames == 0:
+
+            def _build_cmd(use_gpu):
+                c = ["ffmpeg", "-v", "error"]
+                if use_gpu:
+                    c += ["-hwaccel", "cuda", "-hwaccel_device", str(gpu_id), "-hwaccel_output_format", "cuda"]
+                c += ["-i", str(video_path)]
+                if use_gpu:
+                    vf = f"hwdownload,format=nv12,format=rgb24,select='{select_expr}'"
+                else:
+                    vf = f"select='{select_expr}'"
+                c += ["-vf", vf, "-vsync", "0", "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"]
+                return c
+
+            # 尝试 GPU → 失败则回退 CPU
+            use_gpu_flag = gpu_id >= 0
+            for attempt in range(2):
+                cmd = _build_cmd(use_gpu_flag)
+                frames_data, proc = _run_ffmpeg(cmd, frame_size, num_frames)
+                if proc.returncode == 0 and frames_data:
+                    break
+                if use_gpu_flag:
+                    # GPU 失败，回退 CPU 重试一次
+                    use_gpu_flag = False
+                    continue
+                # CPU 也失败
+                stderr_msg = proc.stderr.read(500).decode(errors="replace") if proc.stderr else ""
+                print(f"[错误] {video_path.name}: ffmpeg rc={proc.returncode} {stderr_msg[:200]}")
+                break
+
+            if not frames_data:
                 stats["empty"] += 1
                 continue
 
-            # 写入 LMDB
+            # 写入 LMDB（逐帧处理，内存只保留 1 帧）
             txn = env.begin(write=True)
             frame_count = 0
             try:
-                for i in range(actual_frames):
-                    offset = i * frame_size
-                    chunk = raw[offset : offset + frame_size]
-                    frame_rgb = np.frombuffer(chunk, dtype=np.uint8).reshape(height, width, 3)
-                    # RGB → BGR → JPEG 编码
+                for raw_frame in frames_data:
+                    frame_rgb = np.frombuffer(raw_frame, dtype=np.uint8).reshape(height, width, 3)
                     frame_bgr = frame_rgb[:, :, ::-1]
                     _, buf = cv2.imencode(".jpg", frame_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
                     txn.put(f"{prefix}/{frame_count:02d}".encode(), buf.tobytes())
@@ -234,10 +247,11 @@ def main():
             if not batch:
                 continue
             if gpu_ids:
-                # round-robin 分配 GPU：worker i → GPU (i % num_gpus)
                 assigned_gpu = gpu_ids[i % len(gpu_ids)]
             else:
-                assigned_gpu = -1  # CPU 模式
+                assigned_gpu = -1
+            tag = f"GPU{assigned_gpu}" if assigned_gpu >= 0 else "CPU"
+            print(f"  Worker {i} ({len(batch)} 条视频) → {tag}")
             futures.append(executor.submit(_worker_extract, batch, shard_dirs[i], args.num_frames, assigned_gpu))
         for future in tqdm.tqdm(as_completed(futures), total=len(futures), desc="抽帧"):
             try:
