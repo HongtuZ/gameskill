@@ -1,4 +1,5 @@
 import argparse
+import glob
 import os
 import pickle
 import shutil
@@ -7,13 +8,11 @@ import tempfile
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
-import cv2
 import lmdb
-import numpy as np
 import tqdm
 
 NUM_FRAMES = 20  # 每条视频抽取帧数
-MAP_SIZE = 25 * 1024 * 1024 * 1024  # 80GB，必须大于总数据量
+MAP_SIZE = 10 * 1024 * 1024 * 1024  # 10GB，必须大于总数据量
 
 
 def _list_gpus() -> list:
@@ -28,8 +27,7 @@ def _list_gpus() -> list:
         if r.returncode == 0 and r.stdout.strip():
             gpus = []
             for line in r.stdout.strip().split("\n"):
-                # split 限制次数，防止 GPU 名称含逗号（如 "RTX PRO 6000, xxx"）
-                parts = line.split(",", 1)
+                parts = line.split(",", 1)  # 限制分割次数，GPU 名称可能含逗号
                 if len(parts) >= 2:
                     idx, name = int(parts[0].strip()), parts[1].strip()
                     gpus.append((idx, name))
@@ -42,7 +40,7 @@ def _list_gpus() -> list:
 
 
 def _probe_video(video_path: Path) -> tuple:
-    """用 ffprobe 获取视频总帧数和分辨率（读容器元数据，不解码）"""
+    """用 ffprobe 获取视频总帧数（读容器元数据，不解码）"""
     cmd = [
         "ffprobe",
         "-v",
@@ -50,7 +48,7 @@ def _probe_video(video_path: Path) -> tuple:
         "-select_streams",
         "v:0",
         "-show_entries",
-        "stream=nb_frames,width,height,duration,r_frame_rate",
+        "stream=nb_frames,duration,r_frame_rate",
         "-of",
         "default=noprint_wrappers=1",
         str(video_path),
@@ -62,17 +60,12 @@ def _probe_video(video_path: Path) -> tuple:
             k, v = line.split("=", 1)
             info[k.strip()] = v.strip()
 
-    width = int(info.get("width", 0))
-    height = int(info.get("height", 0))
-
-    # 优先用 nb_frames
     total_frames = 0
     try:
         total_frames = int(info.get("nb_frames", 0))
     except (ValueError, TypeError):
         pass
 
-    # 回退到 duration * fps
     if total_frames <= 0:
         try:
             duration = float(info.get("duration", 0))
@@ -84,41 +77,27 @@ def _probe_video(video_path: Path) -> tuple:
         except Exception:
             pass
 
-    return total_frames, width, height
-
-
-def _run_ffmpeg(cmd, frame_size, num_frames, timeout=120):
-    """
-    流式读取 ffmpeg 管道输出，逐帧返回 bytes，避免一次性加载全部数据到内存。
-    返回 (actual_frames_count, frame_data_list)
-    """
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    frames = []
-    for i in range(num_frames):
-        chunk = proc.stdout.read(frame_size)
-        if len(chunk) < frame_size:
-            break
-        frames.append(chunk)
-    proc.stdout.close()
-    proc.wait(timeout=timeout)
-    return frames, proc
+    return total_frames
 
 
 def _worker_extract(videos_batch, shard_dir, num_frames, gpu_id=-1):
     """
-    Worker 进程：用 ffmpeg 管道抽帧，直接写入独立 LMDB 分片。
-    gpu_id >= 0 表示使用指定 GPU 硬件解码，-1 表示 CPU 软件解码。
-    GPU 解码失败时自动回退 CPU。
+    Worker 进程：ffmpeg 抽帧输出 JPEG 临时文件 → 读入 LMDB。
+    gpu_id >= 0 使用指定 GPU 硬件解码，-1 使用 CPU。
+    GPU 失败自动回退 CPU。
     返回 (stats_dict, video_stems_set)
     """
-    env = lmdb.open(shard_dir, map_size=MAP_SIZE, writemap=True)
+    env = lmdb.open(shard_dir, map_size=MAP_SIZE)
     stats = {"success": 0, "empty": 0, "failed": 0}
     video_stems = set()
 
+    # 每个 worker 独享临时目录
+    tmp_dir = tempfile.mkdtemp(prefix=f"worker_frames_{gpu_id}_")
+
     for video_path in videos_batch:
         try:
-            total_frames, width, height = _probe_video(video_path)
-            if total_frames == 0 or width == 0 or height == 0:
+            total_frames = _probe_video(video_path)
+            if total_frames == 0:
                 stats["empty"] += 1
                 continue
 
@@ -126,54 +105,77 @@ def _worker_extract(videos_batch, shard_dir, num_frames, gpu_id=-1):
             select_expr = "+".join(f"eq(n\\,{idx})" for idx in indices)
             prefix = f"{video_path.parent.name}/{video_path.stem}"
             video_stems.add(prefix)
-            frame_size = width * height * 3  # 单帧字节数 (RGB)
 
             def _build_cmd(use_gpu):
-                c = ["ffmpeg", "-v", "error"]
+                c = ["ffmpeg", "-y", "-v", "error"]
                 if use_gpu:
-                    c += ["-hwaccel", "cuda", "-hwaccel_device", str(gpu_id), "-hwaccel_output_format", "cuda"]
+                    c += ["-hwaccel", "cuda", "-hwaccel_device", str(gpu_id)]
                 c += ["-i", str(video_path)]
                 if use_gpu:
-                    vf = f"hwdownload,format=nv12,format=rgb24,select='{select_expr}'"
+                    vf = f"hwdownload,format=nv12,select='{select_expr}'"
                 else:
                     vf = f"select='{select_expr}'"
-                c += ["-vf", vf, "-vsync", "0", "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"]
+                c += [
+                    "-vf",
+                    vf,
+                    "-vsync",
+                    "0",
+                    "-frames:v",
+                    str(num_frames),
+                    "-q:v",
+                    "2",
+                    str(Path(tmp_dir) / "%04d.jpg"),
+                ]
                 return c
 
             # 尝试 GPU → 失败则回退 CPU
             use_gpu_flag = gpu_id >= 0
-            for attempt in range(2):
+            ok = False
+            for _ in range(2):
+                # 清理上次尝试的残留文件
+                for f in glob.glob(os.path.join(tmp_dir, "*.jpg")):
+                    os.remove(f)
+
                 cmd = _build_cmd(use_gpu_flag)
-                frames_data, proc = _run_ffmpeg(cmd, frame_size, num_frames)
-                if proc.returncode == 0 and frames_data:
+                proc = subprocess.run(cmd, capture_output=True, timeout=120)
+
+                if proc.returncode == 0:
+                    ok = True
                     break
                 if use_gpu_flag:
-                    # GPU 失败，回退 CPU 重试一次
-                    use_gpu_flag = False
+                    use_gpu_flag = False  # GPU 失败，回退 CPU
                     continue
                 # CPU 也失败
-                stderr_msg = proc.stderr.read(500).decode(errors="replace") if proc.stderr else ""
-                print(f"[错误] {video_path.name}: ffmpeg rc={proc.returncode} {stderr_msg[:200]}")
+                err = proc.stderr.decode(errors="replace")[:300]
+                print(f"[错误] {video_path.name}: {err}")
                 break
 
-            if not frames_data:
+            if not ok:
                 stats["empty"] += 1
                 continue
 
-            # 写入 LMDB（逐帧处理，内存只保留 1 帧）
+            # 读取 JPEG 文件写入 LMDB
+            jpg_files = sorted(glob.glob(os.path.join(tmp_dir, "*.jpg")))
+            if not jpg_files:
+                stats["empty"] += 1
+                continue
+
             txn = env.begin(write=True)
             frame_count = 0
             try:
-                for raw_frame in frames_data:
-                    frame_rgb = np.frombuffer(raw_frame, dtype=np.uint8).reshape(height, width, 3)
-                    frame_bgr = frame_rgb[:, :, ::-1]
-                    _, buf = cv2.imencode(".jpg", frame_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
-                    txn.put(f"{prefix}/{frame_count:02d}".encode(), buf.tobytes())
+                for jpg_path in jpg_files:
+                    with open(jpg_path, "rb") as f:
+                        data = f.read()
+                    txn.put(f"{prefix}/{frame_count:02d}".encode(), data)
                     frame_count += 1
                 txn.commit()
             except Exception:
                 txn.abort()
                 raise
+
+            # 清理本轮临时文件
+            for f in jpg_files:
+                os.remove(f)
 
             stats["success" if frame_count > 0 else "empty"] += 1
 
@@ -181,15 +183,19 @@ def _worker_extract(videos_batch, shard_dir, num_frames, gpu_id=-1):
             print(f"[错误] {video_path.name}: {e}")
             stats["failed"] += 1
 
+    # 清理临时目录
+    shutil.rmtree(tmp_dir, ignore_errors=True)
     env.close()
     return stats, video_stems
 
 
 def _merge_shards(shard_dirs, lmdb_path, map_size):
     """将多个 LMDB 分片合并为最终 LMDB"""
-    final_env = lmdb.open(str(lmdb_path), map_size=map_size, writemap=True)
+    final_env = lmdb.open(str(lmdb_path), map_size=map_size)
 
     for shard_dir in shard_dirs:
+        if not Path(shard_dir).exists():
+            continue
         shard_env = lmdb.open(shard_dir, readonly=True, lock=False)
         with shard_env.begin() as src_txn:
             with final_env.begin(write=True) as dst_txn:
@@ -202,7 +208,7 @@ def _merge_shards(shard_dirs, lmdb_path, map_size):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="视频并行抽帧写入 LMDB（ffmpeg 管道 + 多进程分片）")
+    parser = argparse.ArgumentParser(description="视频并行抽帧写入 LMDB（ffmpeg + 多进程分片）")
     parser.add_argument("--video-dir", required=True, help="视频根目录，如 ./dataset/videos")
     parser.add_argument("--lmdb-path", required=True, help="输出 LMDB 路径，如 ./game_frames.lmdb")
     parser.add_argument("--map-size", type=int, default=MAP_SIZE, help="最终 LMDB map_size 上限(字节)")
@@ -239,8 +245,7 @@ def main():
     total_stats = {"success": 0, "empty": 0, "failed": 0}
     all_video_stems = set()
 
-    # ── 阶段 1：多进程并行 ffmpeg 管道抽帧 → 各自 LMDB 分片（无锁，真正并行） ──
-    # GPU 模式下，worker 按 round-robin 分配到各 GPU，实现多卡并行
+    # ── 阶段 1：多进程并行抽帧 → 各自 LMDB 分片 ──
     with ProcessPoolExecutor(max_workers=args.workers) as executor:
         futures = []
         for i, batch in enumerate(batches):
@@ -273,7 +278,7 @@ def main():
         "video_stems": sorted(all_video_stems),
         "frames_per_video": args.num_frames,
     }
-    final_env = lmdb.open(str(lmdb_path), map_size=args.map_size, writemap=True)
+    final_env = lmdb.open(str(lmdb_path), map_size=args.map_size)
     with final_env.begin(write=True) as txn:
         txn.put(b"__meta__", pickle.dumps(meta))
     final_env.close()
