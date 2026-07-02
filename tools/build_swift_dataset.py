@@ -81,7 +81,7 @@ def build_think_content(annotation: Dict[str, Any]) -> str:
 
 def build_answer_content(annotation: Dict[str, Any]) -> str:
     """构造  /think  之后的最终答案（不含 think 标签）"""
-    need_guidance = annotation.get("guide", {}).guidance.get("need", False)
+    need_guidance = annotation.get("guide", {}).get("need", False)
     guidance = annotation.get("guide", {}).get("advice")
 
     guidance_flag = "是" if need_guidance else "否"
@@ -121,7 +121,7 @@ def build_sample(
 
 
 def process_annotation_file(
-    json_path: Path, video_root: Path, think_loss_scale: float, answer_loss_scale: float
+    json_path: Path, annotation_root: Path, video_root: Path, think_loss_scale: float, answer_loss_scale: float
 ) -> Optional[Dict[str, Any]]:
     """处理单个注释文件"""
     try:
@@ -131,15 +131,15 @@ def process_annotation_file(
         print(f"[错误] JSON 解析失败: {json_path} | {e}")
         return None
 
-    meta = annotation.get("meta", {})
-    source_clip = meta.get("source_clip", "").strip()
-    game = meta.get("game", "unknown").strip()
+    rel_json_path = json_path.relative_to(annotation_root)
 
-    video_path = (video_root / game / source_clip).with_suffix(".mp4")
+    video_path = video_root / rel_json_path.with_suffix(".mp4")
     if not video_path.exists():
         print(f"[WARNNING] 视频文件不存在: {str(video_path)}")
         return None
     video_path = video_path.resolve()
+
+    game = rel_json_path.parts[0]
 
     return build_sample(
         game, annotation, video_path, think_loss_scale=think_loss_scale, answer_loss_scale=answer_loss_scale
@@ -150,25 +150,18 @@ def build_dataset(
     annotation_root: Path,
     video_root: Path,
     output_path: Path,
-    games: Optional[List[str]],
     think_loss_scale: float,
     answer_loss_scale: float,
 ) -> None:
     """主流程：扫描注释目录，生成 JSONL"""
-    json_files = sorted(annotation_root.rglob("*_annotation.json"))
+    json_files = sorted(annotation_root.rglob("*.json"))
     print(f"[信息] 发现 {len(json_files)} 个注释文件")
 
     samples = []
     skip_count = 0
 
     for jpath in json_files:
-        if games:
-            rel = jpath.relative_to(annotation_root)
-            game_in_path = rel.parts[0] if rel.parts else ""
-            if game_in_path not in games:
-                continue
-
-        sample = process_annotation_file(jpath, video_root, think_loss_scale, answer_loss_scale)
+        sample = process_annotation_file(jpath, annotation_root, video_root, think_loss_scale, answer_loss_scale)
         if sample:
             samples.append(sample)
         else:
@@ -289,7 +282,6 @@ if __name__ == "__main__":
     parser.add_argument("--annotation-root", type=Path, default=ANNOTATION_ROOT, help="注释 JSON 根目录")
     parser.add_argument("--video-root", type=Path, default=VIDEO_ROOT, help="视频文件根目录")
     parser.add_argument("--output", type=Path, default=OUTPUT_PATH, help="输出 JSONL 路径")
-    parser.add_argument("--games", nargs="+", default=None, help="过滤指定游戏，如 delta valorant")
     parser.add_argument(
         "--think-loss-scale", type=float, default=DEFAULT_THINK_LOSS_SCALE, help="think 部分 loss_scale（默认 1.0）"
     )
@@ -309,7 +301,6 @@ if __name__ == "__main__":
         annotation_root=args.annotation_root,
         video_root=args.video_root,
         output_path=args.output,
-        games=args.games,
         think_loss_scale=args.think_loss_scale,
         answer_loss_scale=args.answer_loss_scale,
     )

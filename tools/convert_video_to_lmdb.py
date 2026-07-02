@@ -11,7 +11,7 @@ import lmdb
 import tqdm
 
 NUM_FRAMES = 20  # 每条视频抽取帧数
-MAP_SIZE = 80 * 1024 * 1024 * 1024  # 80GB，必须大于总数据量
+MAP_SIZE = 25 * 1024 * 1024 * 1024  # 80GB，必须大于总数据量
 
 
 def _worker_extract(videos_batch, shard_dir, num_frames):

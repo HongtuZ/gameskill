@@ -2,7 +2,7 @@ from pathlib import Path
 
 # 配置
 ANNOTATIONS_DIR = "annotations"  # 存放 .json 标注文件的目录
-VIDEOS_DIR = "dataset_videos"  # 存放 .mp4 视频文件的目录
+VIDEOS_DIR = "/root/autodl-tmp/dataset"  # 存放 .mp4 视频文件的目录
 
 
 def main():
