@@ -16,19 +16,28 @@ NUM_FRAMES = 20  # 每条视频抽取帧数
 MAP_SIZE = 25 * 1024 * 1024 * 1024  # 80GB，必须大于总数据量
 
 
-def _check_gpu() -> bool:
-    """检测是否有可用的 NVIDIA GPU"""
+def _list_gpus() -> list:
+    """检测所有可用的 NVIDIA GPU，返回 GPU 名称列表"""
     try:
         r = subprocess.run(
-            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"], capture_output=True, text=True, timeout=5
+            ["nvidia-smi", "--query-gpu=index,name", "--format=csv,noheader,nounits"],
+            capture_output=True,
+            text=True,
+            timeout=5,
         )
         if r.returncode == 0 and r.stdout.strip():
-            name = r.stdout.strip().split("\n")[0]
-            print(f"检测到 GPU: {name}")
-            return True
+            gpus = []
+            for line in r.stdout.strip().split("\n"):
+                parts = line.split(",")
+                if len(parts) >= 2:
+                    idx, name = int(parts[0].strip()), parts[1].strip()
+                    gpus.append((idx, name))
+            for idx, name in gpus:
+                print(f"  GPU {idx}: {name}")
+            return [idx for idx, _ in gpus]
     except Exception:
         pass
-    return False
+    return []
 
 
 def _probe_video(video_path: Path) -> tuple:
@@ -77,9 +86,10 @@ def _probe_video(video_path: Path) -> tuple:
     return total_frames, width, height
 
 
-def _worker_extract(videos_batch, shard_dir, num_frames, use_gpu=False):
+def _worker_extract(videos_batch, shard_dir, num_frames, gpu_id=-1):
     """
     Worker 进程：用 ffmpeg 管道抽帧，直接写入独立 LMDB 分片。
+    gpu_id >= 0 表示使用指定 GPU 硬件解码，-1 表示 CPU 软件解码。
     返回 (stats_dict, video_stems_set)
     """
     env = lmdb.open(shard_dir, map_size=MAP_SIZE, writemap=True)
@@ -101,10 +111,11 @@ def _worker_extract(videos_batch, shard_dir, num_frames, use_gpu=False):
 
             # ffmpeg 解码 → rawvideo 管道输出，纯内存无磁盘 I/O
             cmd = ["ffmpeg", "-v", "error"]
-            if use_gpu:
-                cmd += ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
+            if gpu_id >= 0:
+                # 指定 GPU 硬件解码
+                cmd += ["-hwaccel", "cuda", "-hwaccel_device", str(gpu_id), "-hwaccel_output_format", "cuda"]
             cmd += ["-i", str(video_path)]
-            if use_gpu:
+            if gpu_id >= 0:
                 # GPU 解码后先下载到 CPU，再做 select 过滤
                 vf = f"hwdownload,format=nv12,format=rgb24,select='{select_expr}'"
             else:
@@ -184,14 +195,18 @@ def main():
     parser.add_argument("--map-size", type=int, default=MAP_SIZE, help="最终 LMDB map_size 上限(字节)")
     parser.add_argument("--workers", "-w", type=int, default=8, help="并行进程数")
     parser.add_argument("--num-frames", type=int, default=NUM_FRAMES, help="每条视频抽取帧数")
-    parser.add_argument("--gpu", action="store_true", help="使用 NVIDIA GPU 硬件解码加速")
+    parser.add_argument("--gpu", action="store_true", help="使用 NVIDIA GPU 硬件解码加速（自动分配多 GPU）")
     args = parser.parse_args()
 
-    # GPU 检测
-    use_gpu = args.gpu
-    if use_gpu and not _check_gpu():
-        print("未检测到 NVIDIA GPU，回退到 CPU 模式")
-        use_gpu = False
+    # GPU 检测与分配
+    gpu_ids = []
+    if args.gpu:
+        print("检测 GPU...")
+        gpu_ids = _list_gpus()
+        if not gpu_ids:
+            print("未检测到 NVIDIA GPU，回退到 CPU 模式")
+        else:
+            print(f"共 {len(gpu_ids)} 个 GPU 可用")
 
     video_root = Path(args.video_dir)
     lmdb_path = Path(args.lmdb_path)
@@ -212,12 +227,18 @@ def main():
     all_video_stems = set()
 
     # ── 阶段 1：多进程并行 ffmpeg 管道抽帧 → 各自 LMDB 分片（无锁，真正并行） ──
+    # GPU 模式下，worker 按 round-robin 分配到各 GPU，实现多卡并行
     with ProcessPoolExecutor(max_workers=args.workers) as executor:
-        futures = [
-            executor.submit(_worker_extract, batch, shard_dirs[i], args.num_frames, use_gpu)
-            for i, batch in enumerate(batches)
-            if batch
-        ]
+        futures = []
+        for i, batch in enumerate(batches):
+            if not batch:
+                continue
+            if gpu_ids:
+                # round-robin 分配 GPU：worker i → GPU (i % num_gpus)
+                assigned_gpu = gpu_ids[i % len(gpu_ids)]
+            else:
+                assigned_gpu = -1  # CPU 模式
+            futures.append(executor.submit(_worker_extract, batch, shard_dirs[i], args.num_frames, assigned_gpu))
         for future in tqdm.tqdm(as_completed(futures), total=len(futures), desc="抽帧"):
             try:
                 stats, stems = future.result()
