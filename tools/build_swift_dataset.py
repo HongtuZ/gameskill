@@ -1,6 +1,5 @@
 import argparse
 import json
-import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -26,48 +25,55 @@ def load_game_prompt(game: str) -> str:
     return prompt_path.read_text(encoding="utf-8")
 
 
-def remove_reasoning_step(reasoning_text, step_index_to_remove=2):
-    """
-    删除 reasoning 字符串中的指定步骤，并重新编号
-
-    参数:
-        reasoning_text: 原始 reasoning 字符串
-        step_index_to_remove: 要删除的步骤索引（从0开始，默认2=第3步）
-
-    返回:
-        处理后的 reasoning 字符串
-    """
-    pattern = r"(\d+)\)\s*([^：:]+)[：:](.*?)(?=\d+\)\s*|$)"
-    matches = re.findall(pattern, reasoning_text, re.DOTALL)
-
-    if not matches or step_index_to_remove >= len(matches):
-        return reasoning_text
-
-    # 删除指定步骤并重新编号
-    filtered = [m for i, m in enumerate(matches) if i != step_index_to_remove]
-
-    new_reasoning = ""
-    for i, (old_num, title, content) in enumerate(filtered, 1):
-        content_clean = " ".join(content.strip().split())
-        new_reasoning += f"{i}) {title.strip()}：{content_clean}"
-
-    return new_reasoning
-
-
 def build_think_content(annotation: Dict[str, Any]) -> str:
     parts = []
+    game_view = annotation.get("game_view")
+    map_name = annotation.get("map_name")
+    ego_name = annotation.get("ego_name")
+    stage = annotation.get("stage")
+    team = annotation.get("team")
+    teammates = annotation.get("teammates")
+    enemies = annotation.get("enemies")
+    kills = annotation.get("kills")
+    base_info = ""
+    if map_name:
+        base_info += f"当前地图：{map_name}\n"
+    if game_view:
+        base_info += f"当前游戏视角：{game_view}\n"
+    if ego_name:
+        base_info += f"当前角色：{ego_name}\n"
+    if stage:
+        base_info += f"当前游戏阶段：{stage}\n"
+    if team:
+        base_info += f"当前阵营：{team}\n"
+    if teammates:
+        base_info += f"队友列表：{teammates}\n"
+    if enemies:
+        base_info += f"敌人列表：{enemies}\n"
+    if kills:
+        base_info += "击杀信息:\n"
+        for kill in kills:
+            method = kill.get("method")
+            if "复活" in method:
+                method = "复活"
+            elif "技能" in method:
+                method = "使用技能击杀"
+            elif "击杀" in method:
+                method = "击杀"
+            else:
+                method = f"使用{method}击杀"
+            base_info += f"{kill.get('side1')}{kill.get('hero1')}{method}{kill.get('side2')}{kill.get('hero2')}\n"
+    parts.append(f"【基本信息】:\n{base_info}")
 
-    situation = annotation.get("situation_analysis", "").strip()
-    if situation:
-        parts.append(f"【局势分析】{situation}")
+    description = annotation.get("reasons", {}).get("description").strip()
+    situation = annotation.get("reasons", {}).get("situation").strip()
+    guidance_reason = annotation.get("reasons", {}).get("guidance_reason").strip()
 
-    silence = annotation.get("silence_reason")
-    if silence and str(silence).strip() and str(silence).lower() != "null":
-        parts.append(f"【沉默原因】{silence.strip()}")
+    if description:
+        parts.append(f"【局势分析】{description + situation}")
 
-    reasoning = annotation.get("reasoning", "").strip()
-    if reasoning:
-        parts.append(f"【推理过程】{remove_reasoning_step(reasoning)}")
+    if guidance_reason:
+        parts.append(f"【指导原因】{guidance_reason}")
 
     think_body = "\n".join(parts)
     return f"<think>\n{think_body}\n</think>\n"
@@ -75,9 +81,8 @@ def build_think_content(annotation: Dict[str, Any]) -> str:
 
 def build_answer_content(annotation: Dict[str, Any]) -> str:
     """构造  /think  之后的最终答案（不含 think 标签）"""
-    need_guidance = annotation.get("need_guidance", False)
-    urgency = annotation.get("guidance_urgency", "low").strip()
-    guidance = annotation.get("guidance_content")
+    need_guidance = annotation.get("guide", {}).guidance.get("need", False)
+    guidance = annotation.get("guide", {}).get("advice")
 
     guidance_flag = "是" if need_guidance else "否"
     if guidance and str(guidance).strip() and str(guidance).lower() != "null":
@@ -85,7 +90,7 @@ def build_answer_content(annotation: Dict[str, Any]) -> str:
     else:
         guidance_text = "无"
 
-    return f"【是否需要指导】{guidance_flag}\n【紧急程度】{urgency}\n【指导内容】{guidance_text}"
+    return f"【是否需要指导】{guidance_flag}\n【指导内容】{guidance_text}"
 
 
 def build_sample(
@@ -95,7 +100,6 @@ def build_sample(
     think_loss_scale: float = DEFAULT_THINK_LOSS_SCALE,
     answer_loss_scale: float = DEFAULT_ANSWER_LOSS_SCALE,
 ) -> Dict[str, Any]:
-    game_prompt = load_game_prompt(game_name)
     think_content = build_think_content(annotation)
     answer_content = build_answer_content(annotation)
 
