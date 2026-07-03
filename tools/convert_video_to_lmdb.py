@@ -189,9 +189,31 @@ def _worker_extract(videos_batch, shard_dir, num_frames, gpu_id=-1, tmp_dir_base
     return stats, video_stems
 
 
+def _get_dir_size(path: str) -> int:
+    """递归计算目录大小（字节）"""
+    total = 0
+    for dirpath, _, filenames in os.walk(path):
+        for f in filenames:
+            fp = os.path.join(dirpath, f)
+            try:
+                total += os.path.getsize(fp)
+            except OSError:
+                pass
+    return total
+
+
 def _merge_shards(shard_dirs, lmdb_path, map_size):
     """将多个 LMDB 分片合并为最终 LMDB"""
-    final_env = lmdb.open(str(lmdb_path), map_size=map_size)
+    # 自动估算所需 map_size：所有分片数据总量 × 1.5 倍余量
+    total_data_size = sum(_get_dir_size(d) for d in shard_dirs)
+    required_map_size = int(total_data_size * 1.5)
+    # 取用户指定值和自动估算值中的较大者
+    effective_map_size = max(map_size, required_map_size)
+    # 至少 1GB
+    effective_map_size = max(effective_map_size, 1 * 1024 * 1024 * 1024)
+    print(f"  分片数据总量: {total_data_size / 1024**3:.2f} GB, 目标 map_size: {effective_map_size / 1024**3:.1f} GB")
+
+    final_env = lmdb.open(str(lmdb_path), map_size=effective_map_size)
 
     for shard_dir in shard_dirs:
         if not Path(shard_dir).exists():

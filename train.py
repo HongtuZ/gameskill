@@ -36,7 +36,7 @@ OUTPUT_DIR = "output/Qwen3.5-4B-lmdb"
 
 MODEL_ID = "Qwen/Qwen3.5-4B"
 
-MAX_LENGTH = 16384
+MAX_LENGTH = 24 * 1024 # 24K
 NUM_FRAMES = 20  # 与 LMDB 中的 frames_per_video 一致
 
 # LoRA 配置
@@ -194,14 +194,16 @@ def main():
         template.model = model
 
     # 6. 包装为 LazyLLMDataset（延迟 tokenize，出错时自动换样本）
-    train_dataset = LazyLLMDataset(train_dataset, template.encode, random_state=42, n_try_fetch=10, strict=False)
-    val_dataset = LazyLLMDataset(val_dataset, template.encode, random_state=42, n_try_fetch=10, strict=False)
+    #    n_try_fetch 增大到 50，避免连续多个坏样本导致放弃
+    #    traceback_limit=20 打印前 20 次错误的详细信息，方便定位真正原因
+    train_dataset = LazyLLMDataset(train_dataset, template.encode, random_state=42, n_try_fetch=50, strict=False, traceback_limit=20)
+    val_dataset = LazyLLMDataset(val_dataset, template.encode, random_state=42, n_try_fetch=50, strict=False, traceback_limit=20)
 
     # 快速测试一个样本，确认编码正常
     logger.info("Testing encode on first sample...")
     test_data = train_dataset[0]
     logger.info(f"Encoded keys: {list(test_data.keys())}")
-    template.print_inputs(test_data)
+    # template.print_inputs(test_data)
 
     # 7. LoRA 配置
     #    对应命令行: --target_modules all-linear（由 get_multimodal_target_regex 自动生成）
@@ -227,8 +229,8 @@ def main():
     training_args = Seq2SeqTrainingArguments(
         output_dir=OUTPUT_DIR,
         learning_rate=1e-4,
-        per_device_train_batch_size=10,
-        per_device_eval_batch_size=10,
+        per_device_train_batch_size=2,
+        per_device_eval_batch_size=2,
         gradient_checkpointing=True,
         weight_decay=0.1,
         lr_scheduler_type="cosine",
@@ -240,11 +242,11 @@ def main():
         eval_strategy="steps",
         eval_steps=50,
         gradient_accumulation_steps=1,
-        num_train_epochs=1,
+        num_train_epochs=2,
         metric_for_best_model="loss",
         save_total_limit=2,
         logging_steps=5,
-        dataloader_num_workers=16,
+        dataloader_num_workers=8,
         data_seed=42,
         remove_unused_columns=False,  # 必须保留，否则 videos/messages 会被 HF Trainer 过滤掉
         group_by_length=False,  # 对应 --group_by_length true

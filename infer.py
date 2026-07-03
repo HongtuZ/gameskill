@@ -11,7 +11,7 @@ from swift import get_model_processor, get_template
 from swift.infer_engine import TransformersEngine, InferRequest, RequestConfig
 from pathlib import Path
 
-adapter_dir = 'output/Qwen3.5-4B-lmdb/checkpoint-1423'
+adapter_dir = 'output/Qwen3.5-4B-lmdb/checkpoint-1070'
 enable_thinking = True
 
 model, processor = get_model_processor('Qwen/Qwen3.5-4B')  # attn_impl='flash_attention_2'
@@ -28,9 +28,9 @@ infer_request = InferRequest(
         },
         {"role": "user", "content": "<video>\n请分析这段游戏视频片段，判断是否需要立即给出实时指导。"},
     ],
-    videos=["【槿艺】20250909直播录屏 无畏契约[av115175285854203_]_569.mp4"],
+    videos=["027.mp4"],
 )
-request_config = RequestConfig(max_tokens=1024, temperature=0)
+request_config = RequestConfig(max_tokens=1024, temperature=0.2)
 resp_list = engine.infer([infer_request], request_config=request_config)
 response = resp_list[0].choices[0].message.content
 print(response)
