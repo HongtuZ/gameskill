@@ -5,13 +5,16 @@ from tqdm import tqdm
 
 # 配置
 INPUT_DIRS = [
-    "annos/annotations",
-    "annos/annotations 2",
-    "annos/annotations 3",
-    "annos/annotations 4",
-    "annos/annotations 5",
-    "annos/annotations 6",
-    "annos/annotations-gaotai",
+    "annos/annotations1",
+    "annos/annotations2",
+    "annos/annotations3",
+    "annos/annotations4",
+    "annos/annotations5",
+    "annos/annotations6",
+    "annos/annotations7",
+    "annos/annotations8",
+    "annos/annotations9",
+    "annos/annotations10",
 ]  # 要合并的多个目录（也支持 glob 模式，如 "output/dataset_*"）
 OUTPUT_DIR = "annotations"  # 合并后的输出目录，与原始 dataset 结构一致
 EXISTING_OK = True  # 目标已存在时是否跳过（False 则覆盖）
