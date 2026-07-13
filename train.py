@@ -1,7 +1,7 @@
 import os
 
 # ========== 必须在 import torch 前设置 ==========
-os.environ["CUDA_VISIBLE_DEVICES"] = "0, 1"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 # 以下环境变量控制多模态预处理时的 token / 帧数上限，与命令行等价
 os.environ["IMAGE_MAX_TOKEN_NUM"] = "2048"
@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 import numpy as np
+import tqdm
 from PIL import Image
 from swift import get_model_processor, get_template
 from swift.dataset import LazyLLMDataset
@@ -28,13 +29,13 @@ seed_everything(42)
 
 
 # ========================== 配置区 ==========================
-WEBDATASET_DIR = "/root/autodl-tmp/webdataset_out"  # WebDataset tar 目录
-JSONL_PATH = "dataset.jsonl"  # 训练标注 jsonl
+WEBDATASET_DIR = "/mnt/data/1/user_workspace/zhouhongtu/gameskill_webdataset"  # WebDataset tar 目录
+JSONL_PATH = "dataset/dataset.jsonl"  # 训练标注 jsonl
 OUTPUT_DIR = "output/Qwen3.5-4B-webdataset"
 
 MODEL_ID = "Qwen/Qwen3.5-4B"
 
-MAX_LENGTH = 24 * 1024  # 24K
+MAX_LENGTH = 12 * 1024  # 12K
 NUM_FRAMES = 20  # 与 LMDB 中的 frames_per_video 一致
 
 # LoRA 配置
@@ -68,7 +69,7 @@ class WebDatasetFrameReader:
             raise FileNotFoundError(f"No .tar files found in {self.tar_dir}")
 
         total_entries = 0
-        for shard_path in self.shards:
+        for shard_path in tqdm(self.shards, desc="[扫描 tar 文件]"):
             with tarfile.open(shard_path, "r") as tar:
                 for member in tar:
                     if not member.name.endswith(".jpg"):
@@ -271,7 +272,7 @@ def main():
         metric_for_best_model="loss",
         save_total_limit=2,
         logging_steps=5,
-        dataloader_num_workers=8,
+        dataloader_num_workers=16,
         data_seed=42,
         remove_unused_columns=False,  # 必须保留，否则 videos/messages 会被 HF Trainer 过滤掉
         group_by_length=False,  # 对应 --group_by_length true

@@ -15,7 +15,7 @@ from pathlib import Path
 import tqdm
 
 NUM_FRAMES = 20  # 每条视频抽取帧数
-MAX_TAR_SIZE = 1 * 1024 * 1024 * 1024  # 每个 tar 包最大 1GB
+MAX_TAR_SIZE = 2 * 1024 * 1024 * 1024  # 每个 tar 包最大 1GB
 JPEG_QUALITY = 3  # ffmpeg -q:v 值，2=最高质量，5=较小文件
 
 
@@ -43,8 +43,9 @@ def _list_gpus() -> list:
     return []
 
 
-def _probe_video(video_path: Path) -> int:
-    """用 ffprobe 获取视频总帧数（读容器元数据，不解码）"""
+def _probe_video(video_path: Path, timeout: int = 15, retries: int = 2) -> int:
+    """用 ffprobe 获取视频总帧数（读容器元数据，不解码）。
+    超时/失败时自动重试，避免 I/O 拥塞导致误判。"""
     cmd = [
         "ffprobe",
         "-v",
@@ -57,7 +58,17 @@ def _probe_video(video_path: Path) -> int:
         "default=noprint_wrappers=1",
         str(video_path),
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+    last_err = None
+    for attempt in range(retries):
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+            break
+        except subprocess.TimeoutExpired as e:
+            last_err = e
+            if attempt < retries - 1:
+                time.sleep(1)
+                continue
+            raise last_err
     info = {}
     for line in result.stdout.strip().split("\n"):
         if "=" in line:
@@ -190,7 +201,8 @@ def _worker_extract(
     # 全局样本计数器（跨视频递增）
     global_sample_idx = 0
 
-    for video_path in videos_batch:
+    for video_idx, video_path in enumerate(videos_batch):
+        print(f"[Worker {worker_id}] ({video_idx + 1}/{len(videos_batch)}) {video_path}")
         try:
             total_frames = _probe_video(video_path)
             if total_frames == 0:
@@ -368,7 +380,9 @@ def main():
     progress_counter = Value("i", 0)
     total_videos = sum(len(b) for b in batches)
 
-    with ProcessPoolExecutor(max_workers=args.workers, initializer=_init_worker, initargs=(progress_counter,)) as executor:
+    with ProcessPoolExecutor(
+        max_workers=args.workers, initializer=_init_worker, initargs=(progress_counter,)
+    ) as executor:
         futures = []
         for i, batch in enumerate(batches):
             if not batch:
