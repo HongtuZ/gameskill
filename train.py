@@ -10,11 +10,10 @@ os.environ["FPS_MAX_FRAMES"] = "20"
 
 import io
 import json
-import pickle
+import tarfile
 from pathlib import Path
 from typing import Any, Dict, List
 
-import lmdb
 import numpy as np
 from PIL import Image
 from swift import get_model_processor, get_template
@@ -29,14 +28,13 @@ seed_everything(42)
 
 
 # ========================== 配置区 ==========================
-LMDB_PATH = "/root/autodl-tmp/game_frames.lmdb"  # 你的 LMDB 文件
-JSONL_PATH = "dataset.jsonl"  # 你之前生成的 jsonl
-PROMPTS_DIR = "prompts"  # 你之前生成的 jsonl
-OUTPUT_DIR = "output/Qwen3.5-4B-lmdb"
+WEBDATASET_DIR = "/root/autodl-tmp/webdataset_out"  # WebDataset tar 目录
+JSONL_PATH = "dataset.jsonl"  # 训练标注 jsonl
+OUTPUT_DIR = "output/Qwen3.5-4B-webdataset"
 
 MODEL_ID = "Qwen/Qwen3.5-4B"
 
-MAX_LENGTH = 24 * 1024 # 24K
+MAX_LENGTH = 24 * 1024  # 24K
 NUM_FRAMES = 20  # 与 LMDB 中的 frames_per_video 一致
 
 # LoRA 配置
@@ -47,55 +45,86 @@ FREEZE_VIT = True
 FREEZE_ALIGNER = True
 
 
-# ========================== LMDB 帧读取器 ==========================
-class LMDBFrameReader:
-    """从 LMDB 读取视频帧，返回 List[base64]"""
+# ========================== WebDataset 帧读取器 ==========================
+class WebDatasetFrameReader:
+    """
+    从 WebDataset tar 文件读取视频帧。
+    初始化时扫描所有 tar 建立索引（video_prefix → 帧位置），
+    读取时按需 seek 到对应 offset，利用 OS page cache 加速。
+    """
 
-    def __init__(self, lmdb_path: str):
-        self.env = lmdb.open(
-            lmdb_path,
-            readonly=True,
-            lock=False,
-            readahead=False,  # 避免顺序读取大文件时的预读开销
-            max_readers=64,
+    def __init__(self, tar_dir: str, num_frames: int = 20):
+        self.tar_dir = Path(tar_dir)
+        self.num_frames = num_frames
+        # 索引: video_prefix -> [(frame_idx, shard_path, offset, size), ...]
+        self.index: Dict[str, list] = {}
+        self.shards: List[str] = []
+        self._build_index()
+
+    def _build_index(self):
+        """扫描所有 tar 文件，建立 video_prefix → 帧位置索引"""
+        self.shards = sorted(str(p) for p in self.tar_dir.glob("*.tar"))
+        if not self.shards:
+            raise FileNotFoundError(f"No .tar files found in {self.tar_dir}")
+
+        total_entries = 0
+        for shard_path in self.shards:
+            with tarfile.open(shard_path, "r") as tar:
+                for member in tar:
+                    if not member.name.endswith(".jpg"):
+                        continue
+                    # key 格式: {video_prefix}_{global_idx:08d}
+                    # 分离: video_prefix = key 去掉最后的 _NNNNNNNN
+                    key = member.name[:-4]  # 去掉 .jpg
+                    parts = key.rsplit("_", 1)
+                    if len(parts) != 2:
+                        continue
+                    video_prefix = parts[0]
+                    # member.offset 是 tar 内数据区的起始偏移
+                    offset = member.offset_data
+                    size = member.size
+                    if video_prefix not in self.index:
+                        self.index[video_prefix] = []
+                    self.index[video_prefix].append((shard_path, offset, size))
+                    total_entries += 1
+
+        # 对每个视频的帧按 offset 排序（保证帧顺序）
+        for vp in self.index:
+            self.index[vp].sort(key=lambda x: x[1])
+
+        logger.info(
+            f"WebDataset index built: {len(self.shards)} shards, {len(self.index)} videos, {total_entries} total frames"
         )
-        with self.env.begin() as txn:
-            meta_raw = txn.get(b"__meta__")
-            self.meta = pickle.loads(meta_raw) if meta_raw else {}
-            self.frames_per_video = self.meta.get("frames_per_video", 20)
-            logger.info(f"LMDB loaded: {lmdb_path}")
-            logger.info(
-                f"Meta: total_frames={self.meta.get('total_frames')}, "
-                f"video_count={len(self.meta.get('video_stems', []))}, "
-                f"frames_per_video={self.frames_per_video}"
-            )
 
     def get_frames(self, video_key: str) -> List[Image.Image]:
         """
-        video_key 格式: "game/video_stem"  例: "delta/1101076112_001"
-        LMDB 内键格式: "game/video_stem/00", "game/video_stem/01", ...
+        video_key 格式: "parent_stem"  例: "valorant_001"
+        对应 WebDataset key: "valorant_001_00000000", "valorant_001_00000001", ...
         """
-        frames = []
-        for i in range(self.frames_per_video):
-            frame_key = f"{video_key}/{i:02d}".encode("utf-8")
-            with self.env.begin() as txn:
-                img_jpg = txn.get(frame_key)
-                if img_jpg is None:
-                    if i == 0:
-                        logger.warning(f"[LMDB] Video key not found: {video_key}")
-                    break
-                img = Image.open(io.BytesIO(img_jpg)).convert("RGB")
-                frames.append(img)
-        return frames
+        if video_key not in self.index:
+            raise KeyError(f"Video key not found in WebDataset: {video_key}")
 
-    def close(self):
-        self.env.close()
+        frames = []
+        # 按 shard 分组，减少 tar 文件开关次数
+        by_shard: Dict[str, list] = {}
+        for shard_path, offset, size in self.index[video_key]:
+            by_shard.setdefault(shard_path, []).append((offset, size))
+
+        for shard_path, locations in by_shard.items():
+            with open(shard_path, "rb") as f:
+                for offset, size in locations:
+                    f.seek(offset)
+                    jpg_data = f.read(size)
+                    img = Image.open(io.BytesIO(jpg_data)).convert("RGB")
+                    frames.append(img)
+
+        return frames
 
 
 # ========================== 自定义数据集 ==========================
-class LMDBVideoDataset(Dataset):
+class WebDatasetVideoDataset(Dataset):
     """
-    从 JSONL 读取文本标注（messages / loss_scale），从 LMDB 读取视频帧。
+    从 JSONL 读取文本标注（messages / loss_scale），从 WebDataset tar 读取视频帧。
     输出格式严格符合 ms-swift 多模态标准：
         {
             "messages": [...],
@@ -103,19 +132,13 @@ class LMDBVideoDataset(Dataset):
         }
     """
 
-    def __init__(self, jsonl_path: str, prompts_dir: str, lmdb_reader: LMDBFrameReader):
-        self.prompts = {}
-        for prompt_file in Path(prompts_dir).glob("*.md"):
-            self.prompts[prompt_file.stem] = prompt_file.read_text(encoding="utf-8")
+    def __init__(self, jsonl_path: str, frame_reader: WebDatasetFrameReader):
         self.samples = []
         with open(jsonl_path, "r", encoding="utf-8") as f:
             for line in f:
                 if line.strip():
                     self.samples.append(json.loads(line))
-                else:
-                    print("Warning: Skipping empty line in JSONL")
-        self.lmdb_reader = lmdb_reader
-        logger.info(f"Loaded {list(self.prompts.keys())} prompts from {prompts_dir}")
+        self.frame_reader = frame_reader
         logger.info(f"Loaded {len(self.samples)} samples from {jsonl_path}")
 
     def __len__(self):
@@ -124,17 +147,15 @@ class LMDBVideoDataset(Dataset):
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         sample = self.samples[idx]
 
-        # 原始 videos 字段是文件路径，如 /root/autodl-tmp/dataset/delta/1101076112_001.mp4
+        # 原始 videos 字段是文件路径，如 videos/valorant/捷风/.../001.mp4
         video_path = sample["videos"][0]
         path_obj = Path(video_path)
-        prompt = self.prompts.get(path_obj.parent.name)
-        sample["messages"][0]["content"] += "以下游戏知识供参考：\n\n" + prompt + "\n\n" if prompt else ""
 
-        # 映射为 LMDB key: game/video_stem
-        video_key = f"{path_obj.parent.name}/{path_obj.stem}"
+        # 映射为 WebDataset video_key: parent_stem（与转换脚本的 video_prefix 一致）
+        video_key = f"{path_obj.parent.name}_{path_obj.stem}"
 
-        # 从 LMDB 读取帧
-        frames = self.lmdb_reader.get_frames(video_key)
+        # 从 WebDataset 读取帧
+        frames = self.frame_reader.get_frames(video_key)
         if len(frames) == 0:
             raise ValueError(f"Empty frames for key={video_key}, path={video_path}")
 
@@ -148,11 +169,11 @@ class LMDBVideoDataset(Dataset):
 
 # ========================== 训练主流程 ==========================
 def main():
-    # 1. 初始化 LMDB
-    lmdb_reader = LMDBFrameReader(LMDB_PATH)
+    # 1. 初始化 WebDataset 帧读取器（扫描 tar 建立索引）
+    frame_reader = WebDatasetFrameReader(WEBDATASET_DIR, num_frames=NUM_FRAMES)
 
     # 2. 构建完整数据集
-    full_dataset = LMDBVideoDataset(JSONL_PATH, PROMPTS_DIR, lmdb_reader)
+    full_dataset = WebDatasetVideoDataset(JSONL_PATH, frame_reader)
 
     # 3. 划分训练/验证集（split_dataset_ratio=0.01）
     dataset_size = len(full_dataset)
@@ -196,8 +217,12 @@ def main():
     # 6. 包装为 LazyLLMDataset（延迟 tokenize，出错时自动换样本）
     #    n_try_fetch 增大到 50，避免连续多个坏样本导致放弃
     #    traceback_limit=20 打印前 20 次错误的详细信息，方便定位真正原因
-    train_dataset = LazyLLMDataset(train_dataset, template.encode, random_state=42, n_try_fetch=50, strict=False, traceback_limit=20)
-    val_dataset = LazyLLMDataset(val_dataset, template.encode, random_state=42, n_try_fetch=50, strict=False, traceback_limit=20)
+    train_dataset = LazyLLMDataset(
+        train_dataset, template.encode, random_state=42, n_try_fetch=50, strict=False, traceback_limit=20
+    )
+    val_dataset = LazyLLMDataset(
+        val_dataset, template.encode, random_state=42, n_try_fetch=50, strict=False, traceback_limit=20
+    )
 
     # 快速测试一个样本，确认编码正常
     logger.info("Testing encode on first sample...")
@@ -269,7 +294,6 @@ def main():
     logger.info(f"Last checkpoint: {last_checkpoint}")
 
     # 清理
-    lmdb_reader.close()
     logger.info("Training completed!")
 
 
