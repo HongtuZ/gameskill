@@ -7,7 +7,9 @@ import shutil
 import subprocess
 import tarfile
 import tempfile
-from concurrent.futures import ProcessPoolExecutor, as_completed
+import time
+from concurrent.futures import ProcessPoolExecutor
+from multiprocessing import Value
 from pathlib import Path
 
 import tqdm
@@ -149,6 +151,16 @@ class _TarWriter:
         return self._file_path
 
 
+# 全局进度计数器（通过进程池 initializer 注入到各 worker 进程）
+_progress_counter = None
+
+
+def _init_worker(counter):
+    """进程池初始化：将共享计数器注入 worker 全局命名空间"""
+    global _progress_counter
+    _progress_counter = counter
+
+
 def _worker_extract(
     videos_batch,
     worker_id,
@@ -269,6 +281,10 @@ def _worker_extract(
         except Exception as e:
             print(f"[错误] {video_path.name}: {e}")
             stats["failed"] += 1
+        finally:
+            if _progress_counter is not None:
+                with _progress_counter.get_lock():
+                    _progress_counter.value += 1
 
     # 关闭 tar writer（确保数据 flush）
     writer_info = writer.close()
@@ -348,7 +364,11 @@ def main():
     total_writer_samples = 0
     total_writer_shards = 0
 
-    with ProcessPoolExecutor(max_workers=args.workers) as executor:
+    # 共享进度计数器（跨进程安全）
+    progress_counter = Value("i", 0)
+    total_videos = sum(len(b) for b in batches)
+
+    with ProcessPoolExecutor(max_workers=args.workers, initializer=_init_worker, initargs=(progress_counter,)) as executor:
         futures = []
         for i, batch in enumerate(batches):
             if not batch:
@@ -373,7 +393,22 @@ def main():
                     staging_dir,
                 )
             )
-        for future in tqdm.tqdm(as_completed(futures), total=len(futures), desc="抽帧"):
+
+        # 主进程显示全局进度条
+        pbar = tqdm.tqdm(total=total_videos, desc="处理视频", unit="video")
+        last_count = 0
+        while True:
+            # 检查所有 future 是否完成
+            all_done = all(f.done() for f in futures)
+            current = progress_counter.value
+            pbar.update(current - last_count)
+            last_count = current
+            if all_done:
+                break
+            time.sleep(0.3)
+        pbar.close()
+
+        for future in futures:
             try:
                 stats, tar_files, writer_info = future.result()
                 for k in total_stats:
