@@ -1,7 +1,7 @@
 import os
 
 # ========== 必须在 import torch 前设置 ==========
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0, 1"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 # 以下环境变量控制多模态预处理时的 token / 帧数上限，与命令行等价
 os.environ["IMAGE_MAX_TOKEN_NUM"] = "2048"
@@ -15,7 +15,6 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 import numpy as np
-import tqdm
 from PIL import Image
 from swift import get_model_processor, get_template
 from swift.dataset import LazyLLMDataset
@@ -23,6 +22,7 @@ from swift.trainers import Seq2SeqTrainer, Seq2SeqTrainingArguments
 from swift.tuners import LoraConfig, Swift
 from swift.utils import get_logger, get_model_parameter_info, get_multimodal_target_regex, seed_everything
 from torch.utils.data import Dataset, Subset
+from tqdm import tqdm
 
 logger = get_logger()
 seed_everything(42)
@@ -147,6 +147,8 @@ class WebDatasetVideoDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         sample = self.samples[idx]
+        if "videos" not in sample:
+            return sample
 
         # 原始 videos 字段是文件路径，如 videos/valorant/捷风/.../001.mp4
         video_path = sample["videos"][0]
@@ -267,12 +269,12 @@ def main():
         save_steps=50,
         eval_strategy="steps",
         eval_steps=50,
-        gradient_accumulation_steps=1,
-        num_train_epochs=2,
+        gradient_accumulation_steps=2,
+        num_train_epochs=1,
         metric_for_best_model="loss",
         save_total_limit=2,
         logging_steps=5,
-        dataloader_num_workers=16,
+        dataloader_num_workers=32,
         data_seed=42,
         remove_unused_columns=False,  # 必须保留，否则 videos/messages 会被 HF Trainer 过滤掉
         group_by_length=False,  # 对应 --group_by_length true

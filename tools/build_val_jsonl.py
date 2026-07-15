@@ -29,6 +29,13 @@ class ValData:
         self.need_guidance = guide.get("need", False)
         self.guidance = guide.get("advice", "")
 
+    def is_valid(self) -> bool:
+        if self.game_view != "非局内" and not self.description:
+            return False
+        if self.need_guidance and (not self.guidance or not self.description or not self.guidance_reason):
+            return False
+        return True
+
     def format_kills(self) -> str:
         if not self.kills:
             return "暂无击杀信息"
@@ -264,38 +271,11 @@ def process_json_file(json_path: Path, video_path: Path) -> List[Dict]:
     """处理单个 JSON 文件，返回训练样本列表"""
     val_data = ValData(json_path, video_path)
     samples = []
-    guidance_sample = build_guidance_sample(val_data)
-    if guidance_sample:
-        samples.append(guidance_sample)
+    if not val_data.is_valid():
+        return samples
     think_guidance_sample = build_think_guidance_sample(val_data)
     if think_guidance_sample:
         samples.append(think_guidance_sample)
-    mapname_sample = build_mapname_sample(val_data)
-    if mapname_sample:
-        samples.append(mapname_sample)
-    ego_name_sample = build_ego_name_sample(val_data)
-    if ego_name_sample:
-        samples.append(ego_name_sample)
-    stage_sample = build_stage_sample(val_data)
-    if stage_sample:
-        samples.append(stage_sample)
-    team_sample = build_team_sample(val_data)
-    if team_sample:
-        samples.append(team_sample)
-    description_sample = build_description_sample(val_data)
-    if description_sample:
-        samples.append(description_sample)
-    situation_sample = build_situation_sample(val_data)
-    if situation_sample:
-        samples.append(situation_sample)
-    teammates_sample = build_teammates_sample(val_data)
-    if teammates_sample:
-        samples.append(teammates_sample)
-    if build_enemies_sample(val_data):
-        samples.append(build_enemies_sample(val_data))
-    if build_kills_sample(val_data):
-        samples.append(build_kills_sample(val_data))
-    samples.append(build_gamename_sample(val_data))
     return samples
 
 
