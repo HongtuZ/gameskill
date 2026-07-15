@@ -1,7 +1,7 @@
 import os
 
 # ========== 必须在 import torch 前设置 ==========
-os.environ["CUDA_VISIBLE_DEVICES"] = "0, 1"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 # 以下环境变量控制多模态预处理时的 token / 帧数上限，与命令行等价
 os.environ["IMAGE_MAX_TOKEN_NUM"] = "2048"
@@ -13,6 +13,13 @@ import json
 import tarfile
 from pathlib import Path
 from typing import Any, Dict, List
+
+import torch
+
+# 多 GPU 训练：根据 LOCAL_RANK 设置当前进程使用的设备，消除 init_process_group 警告
+if torch.cuda.is_available():
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    torch.cuda.set_device(local_rank)
 
 import numpy as np
 from PIL import Image
@@ -29,7 +36,7 @@ seed_everything(42)
 
 
 # ========================== 配置区 ==========================
-WEBDATASET_DIR = "/mnt/data/1/user_workspace/zhouhongtu/gameskill_webdataset"  # WebDataset tar 目录
+WEBDATASET_DIR = "../gameskill_webdataset"  # WebDataset tar 目录
 JSONL_PATH = "dataset/dataset.jsonl"  # 训练标注 jsonl
 OUTPUT_DIR = "output/Qwen3.5-4B-webdataset"
 
@@ -257,8 +264,8 @@ def main():
     training_args = Seq2SeqTrainingArguments(
         output_dir=OUTPUT_DIR,
         learning_rate=1e-4,
-        per_device_train_batch_size=2,
-        per_device_eval_batch_size=2,
+        per_device_train_batch_size=8,
+        per_device_eval_batch_size=8,
         gradient_checkpointing=True,
         weight_decay=0.1,
         lr_scheduler_type="cosine",
@@ -269,8 +276,8 @@ def main():
         save_steps=50,
         eval_strategy="steps",
         eval_steps=50,
-        gradient_accumulation_steps=2,
-        num_train_epochs=1,
+        gradient_accumulation_steps=1,
+        num_train_epochs=2,
         metric_for_best_model="loss",
         save_total_limit=2,
         logging_steps=5,
