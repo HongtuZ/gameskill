@@ -98,7 +98,7 @@ def build_think_guidance_sample(val_data: ValData) -> Dict:
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": "<video>\n请分析这段游戏视频片段，判断是否需要立即给出实时指导。"},
-            {"role": "assistant", "content": f"think>\n{val_data.build_think_content()}\n</think>", "loss_scale": 1.0},
+            {"role": "assistant", "content": f"<think>\n{val_data.build_think_content()}\n</think>", "loss_scale": 1.0},
             {"role": "assistant", "content": val_data.build_guidance_content(), "loss_scale": 2.0},
         ],
         "videos": [str(val_data.video_path)],

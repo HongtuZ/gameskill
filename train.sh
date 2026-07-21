@@ -1,1 +1,1 @@
-OMP_NUM_THREADS=16 uv run torchrun --nproc_per_node=2 --master_port=29501 train.py
+OMP_NUM_THREADS=16 uv run torchrun --nproc_per_node=2 --master_port=29505 train.py

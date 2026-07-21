@@ -1,7 +1,7 @@
 import os
 
 # os.environ['SWIFT_DEBUG'] = '1'
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+os.environ["CUDA_VISIBLE_DEVICES"] = "3"
 os.environ["IMAGE_MAX_TOKEN_NUM"] = "2048"
 os.environ["VIDEO_MAX_TOKEN_NUM"] = "2048"
 os.environ["FPS_MAX_FRAMES"] = "20"
@@ -11,7 +11,7 @@ from peft import PeftModel
 from swift import get_model_processor, get_template
 from swift.infer_engine import InferRequest, RequestConfig, TransformersEngine
 
-adapter_dir = "output/Qwen3.5-4B-webdataset/checkpoint-2717"
+adapter_dir = "output/checkpoint-delta"
 enable_thinking = True
 
 model, processor = get_model_processor("Qwen/Qwen3.5-4B")  # attn_impl='flash_attention_2'
@@ -27,7 +27,7 @@ infer_request = InferRequest(
         },
         {"role": "user", "content": "<video>\n请分析这段游戏视频片段，判断是否需要立即给出实时指导。"},
     ],
-    videos=["029.mp4"],
+    videos=["103.mp4"],
 )
 request_config = RequestConfig(max_tokens=1024, temperature=0.0)
 resp_list = engine.infer([infer_request], request_config=request_config)

@@ -120,7 +120,7 @@ def build_think_guidance_sample(delta_data: DeltaData) -> Dict:
             {"role": "user", "content": "<video>\n请分析这段游戏视频片段，判断是否需要立即给出实时指导。"},
             {
                 "role": "assistant",
-                "content": f"think>\n{delta_data.build_think_content()}\n</think>",
+                "content": f"<think>\n{delta_data.build_think_content()}\n</think>",
                 "loss_scale": 1.0,
             },
             {"role": "assistant", "content": delta_data.build_guidance_content(), "loss_scale": 2.0},

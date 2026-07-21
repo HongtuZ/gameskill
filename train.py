@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 import torch
+from tqdm import tqdm
 
 # 多 GPU 训练：根据 LOCAL_RANK 设置当前进程使用的设备，消除 init_process_group 警告
 if torch.cuda.is_available():
@@ -29,7 +30,6 @@ from swift.trainers import Seq2SeqTrainer, Seq2SeqTrainingArguments
 from swift.tuners import LoraConfig, Swift
 from swift.utils import get_logger, get_model_parameter_info, get_multimodal_target_regex, seed_everything
 from torch.utils.data import Dataset, Subset
-from tqdm import tqdm
 
 logger = get_logger()
 seed_everything(42)
@@ -37,12 +37,12 @@ seed_everything(42)
 
 # ========================== 配置区 ==========================
 WEBDATASET_DIR = "../gameskill_webdataset"  # WebDataset tar 目录
-JSONL_PATH = "dataset/dataset.jsonl"  # 训练标注 jsonl
-OUTPUT_DIR = "output/Qwen3.5-4B-webdataset"
+JSONL_PATH = "dataset/val.jsonl"  # 训练标注 jsonl
+OUTPUT_DIR = "output/Qwen3.5-4B-val"
 
 MODEL_ID = "Qwen/Qwen3.5-4B"
 
-MAX_LENGTH = 12 * 1024  # 12K
+MAX_LENGTH = 21 * 1024  # 24K（truncation_strategy 与 Qwen3.5 多模态 position_ids 不兼容，必须避免截断）
 NUM_FRAMES = 20  # 与 LMDB 中的 frames_per_video 一致
 
 # LoRA 配置
@@ -225,13 +225,16 @@ def main():
         template.model = model
 
     # 6. 包装为 LazyLLMDataset（延迟 tokenize，出错时自动换样本）
-    #    n_try_fetch 增大到 50，避免连续多个坏样本导致放弃
-    #    traceback_limit=20 打印前 20 次错误的详细信息，方便定位真正原因
     train_dataset = LazyLLMDataset(
-        train_dataset, template.encode, random_state=42, n_try_fetch=50, strict=False, traceback_limit=20
+        train_dataset, template.encode, random_state=42, n_try_fetch=len(train_dataset), strict=False, traceback_limit=5
     )
     val_dataset = LazyLLMDataset(
-        val_dataset, template.encode, random_state=42, n_try_fetch=50, strict=False, traceback_limit=20
+        val_dataset,
+        template.encode,
+        random_state=42,
+        n_try_fetch=max(1, len(val_dataset)),
+        strict=False,
+        traceback_limit=5,
     )
 
     # 快速测试一个样本，确认编码正常
@@ -264,8 +267,8 @@ def main():
     training_args = Seq2SeqTrainingArguments(
         output_dir=OUTPUT_DIR,
         learning_rate=1e-4,
-        per_device_train_batch_size=8,
-        per_device_eval_batch_size=8,
+        per_device_train_batch_size=2,
+        per_device_eval_batch_size=2,
         gradient_checkpointing=True,
         weight_decay=0.1,
         lr_scheduler_type="cosine",
@@ -276,12 +279,12 @@ def main():
         save_steps=50,
         eval_strategy="steps",
         eval_steps=50,
-        gradient_accumulation_steps=1,
-        num_train_epochs=2,
+        gradient_accumulation_steps=4,
+        num_train_epochs=3,
         metric_for_best_model="loss",
         save_total_limit=2,
         logging_steps=5,
-        dataloader_num_workers=32,
+        dataloader_num_workers=16,
         data_seed=42,
         remove_unused_columns=False,  # 必须保留，否则 videos/messages 会被 HF Trainer 过滤掉
         group_by_length=False,  # 对应 --group_by_length true
